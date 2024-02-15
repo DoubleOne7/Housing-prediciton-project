@@ -1,0 +1,217 @@
+---
+title: "Housing price prediction"
+output: pdf_document
+date: "2024-02-14"
+---
+
+**Predicting Housing Prices in Connecticut**
+\n
+
+In collaboration with a team, I worked on a project aimed at predicting the affordability of housing in Connecticut, a critical concern in North America. Our dataset comprised sales information for 995,644 residential properties sold in 2019 and 2020.
+
+The objective of the project was to develop a predictive model to estimate the sale price of residential properties. We focused on properties sold for less than $10,000,000, which constituted our target range. Leveraging machine learning techniques and statistical analysis, we aimed to provide valuable insights into housing affordability trends in Connecticut.
+
+Our team tackled this challenge by utilizing a portion of the data as a training set, which constituted 20% of the total dataset. We then applied our predictive model to a testing set, which included the private leaderboard, constituting 50% of the testing data.
+
+Key covariates such as List_Year and Date_Recorded were crucial in understanding the temporal dynamics of property sales, while the Address covariate provided insight into the geographical distribution of properties.
+
+By collaborating closely and leveraging our combined expertise in data analysis, statistics, and machine learning, we aimed to deliver accurate predictions of housing prices. Our ultimate goal was to contribute to the ongoing discourse on housing affordability and provide actionable insights for policymakers and stakeholders in Connecticut.
+ 
+
+1. Read in the data
+```{r}
+library(readr)
+library(glmnet)
+library(tidyverse)
+
+
+Xtr = read.csv("Xtr.csv")
+Xte = read.csv("Xte.csv")
+Ytr = read.csv("Ytr.csv")
+pred0 = read.csv("pred0.csv")
+
+head(Xtr)
+head(Xte)
+head(Ytr)
+head(pred0)
+```
+
+2. Data Engineering - Create Listing_Month and Year_Month
+```{r}
+
+Xtr$Date_Recorded = as.Date(Xtr$Date_Recorded, format = "%m/%d/%Y")
+Xtr$List_Month = months(Xtr$Date_Recorded)
+Xte$Date_Recorded = as.Date(Xte$Date_Recorded, format = "%m/%d/%Y")
+Xte$List_Month = months(Xte$Date_Recorded)
+
+Xtr$Year_Month = paste(Xtr$List_Year,"-",Xtr$List_Month)
+Xte$Year_Month = paste(Xte$List_Year,"-",Xte$List_Month)
+
+head(Xtr)
+head(Xte)
+```
+
+3. Data Cleaning
+
+Imputation by filling in median by year and month for Assessed Value because data is skewed by outliers
+```{r}
+years_months = c(Xtr$Year_Month, Xte$Year_Month)
+values = c(Xtr$Assessed_Value, Xte$Assessed_Value)
+for (year_month in unique(years_months)) {
+  mu = median(values[years_months == year_month], na.rm = T)
+  mask = Xtr$Year_Month == year_month & is.na(Xtr$Assessed_Value)
+  Xtr$Assessed_Value[mask] = mu
+  mask = Xte$Year_Month == year_month & is.na(Xte$Assessed_Value)
+  Xte$Assessed_Value[mask] = mu
+}
+
+```
+
+Add a small constant (e.g., 0.01) to avoid NA/NaN/Inf values in log transformation
+```{r}
+const = 0.00001
+Xtr$Assessed_Value <- log(Xtr$Assessed_Value + const)
+Xte$Assessed_Value <- log(Xte$Assessed_Value + const)
+```
+
+Data Cleaning - Imputation by filling in "Unspecified" for Missing Property_Type and Residential_Type
+```{r}
+Xtr <- Xtr %>%
+  mutate(Property_Type = ifelse(Property_Type == "", "unspecified", Property_Type))
+Xte <- Xte %>%
+  mutate(Property_Type = ifelse(Property_Type == "", "unspecified", Property_Type))
+Xtr <- Xtr %>%
+  mutate(Residential_Type = ifelse(Residential_Type == "", "unspecified", Residential_Type))
+Xte <- Xte %>%
+  mutate(Residential_Type = ifelse(Residential_Type == "", "unspecified", Residential_Type))
+```
+
+Imputation by filling in 2 missing List_Month in Xte by "June" because June is the Mode
+```{r}
+Xte[is.na(Xte$List_Month), "List_Month"]<-"June"
+#Data Cleaning - Imputing 1 Unknown Town value in Xte by Bridgeport
+Xte[Xte$Town == "***Unknown***", "Town"]<-"Bridgeport"
+#Data Cleaning - Imputation by filling in 2 missing Date_Recorded years in Xte by 2021 because 2021 is the mode
+Xte[is.na(Xte$List_Year), "Date_Recorded"]<-2021
+```
+
+Aadding interaction effect between assessed year and list year, effect of inflation each year
+```{r}
+Xtr$Assessed_Value_List_Year <- Xtr$Assessed_Value * Xtr$List_Year
+Xte$Assessed_Value_List_Year <- Xte$Assessed_Value * Xte$List_Year
+```
+
+Transform month back to numeric
+```{r}
+month_to_numeric <- c("January" = 1, "February" = 2, "March" = 3, "April" = 4, "May" = 5, "June" = 6,
+                      "July" = 7, "August" = 8, "September" = 9, "October" = 10, "November" = 11, "December" = 12)
+Xtr$List_Month <- month_to_numeric[Xtr$List_Month]
+Xte$List_Month <- month_to_numeric[Xte$List_Month]
+Xtr$Assessed_Value_List_Month <- Xtr$Assessed_Value * Xtr$List_Month
+Xte$Assessed_Value_List_Month <- Xte$Assessed_Value * Xte$List_Month
+```
+
+Adding interactin between Year and Month
+```{r}
+Xtr$List_Year_List_Month <- Xtr$List_Year * Xtr$List_Month
+Xte$List_Year_List_Month <- Xte$List_Year * Xte$List_Month
+
+```
+
+4. Prediction - XGboost
+
+Convert the columns to factors (if not already)
+```{r}
+Xtr = Xtr[, c("Assessed_Value","Property_Type", "List_Month", "Town", "List_Year", "Residential_Type", "Assessed_Value_List_Year",
+              "Assessed_Value_List_Month", "List_Year_List_Month")]
+Xte = Xte[, c("Assessed_Value","Property_Type", "List_Month","Town", "List_Year", "Residential_Type","Assessed_Value_List_Year",
+              "Assessed_Value_List_Month", "List_Year_List_Month")]
+
+non_numeric_columns <- c("Property_Type", "Town", "Residential_Type")
+
+Xtr[, non_numeric_columns] <- lapply(Xtr[, non_numeric_columns], as.factor)
+Xte[, non_numeric_columns] <- lapply(Xte[, non_numeric_columns], as.factor)
+```
+
+
+Perform one-hot encoding manually
+```{r}
+Xtr <- cbind(Xtr, model.matrix(~ 0 + Property_Type  + Town + Residential_Type, data = Xtr))
+Xte <- cbind(Xte, model.matrix(~ 0 + Property_Type  + Town + Residential_Type, data = Xte))
+```
+
+Remove the original non-numeric columns
+```{r}
+library(xgboost)
+Xtr <- Xtr[, -which(names(Xtr) %in% non_numeric_columns)]
+Xte <- Xte[, -which(names(Xte) %in% non_numeric_columns)]
+
+dtrain <- xgb.DMatrix(data = as.matrix(Xtr), label = Ytr$Sale_Amount)
+dtest <- xgb.DMatrix(data = as.matrix(Xte))
+```
+
+5. finding best tuning parameters
+```{r}
+library(caret)
+
+# Define a parameter grid
+param_grid <- expand.grid(
+  nrounds = c(50, 100, 150, 250),
+  max_depth = c(3, 5, 7),
+  eta = c(0.01, 0.1, 0.3),
+  gamma = c(0, 0.1, 0.2),            # gamma
+  colsample_bytree = c(0.6, 0.8, 1), # colsample_bytree
+  min_child_weight = c(1, 3, 5),     # min_child_weight
+  subsample = c(0.6, 0.8, 1)        # subsample
+)
+
+# Set up cross-validation
+control <- trainControl(
+  method = "cv",          # Cross-validation method (k-fold)
+  number = 5,             # Number of folds
+  verboseIter = TRUE,     # Print progress
+  returnData = FALSE,     # Don't return data in the resampling object
+  returnResamp = "all"    # Return resampling results for all models
+)
+
+# Perform random search using the caret package
+set.seed(440)  # For reproducibility
+tuned_model <- train(
+  x = as.matrix(Xtr),
+  y = Ytr$Sale_Amount,
+  method = "xgbTree",     # XGBoost method
+  tuneGrid = param_grid,  # Parameter grid
+  trControl = control     # Cross-validation control
+)
+
+# Get the best hyperparameters
+best_params <- tuned_model$bestTune
+print(best_params)
+```
+
+6. Specify XGBoost Parameters
+```{r}
+params <- list(
+  objective = "reg:squarederror",  # Regression task
+  booster = "gbtree",             # Tree-based model
+  eta = 0.1,                      # Learning rate
+  max_depth = 7                  # Maximum depth of trees
+)
+```
+
+7. Train the XGBoost Model
+```{r}
+model <- xgboost(params = params, data = dtrain, nrounds = 200)
+```
+
+8. Make Predictions
+```{r}
+predictions <- predict(model, dtest)
+```
+
+9. Save Predictions
+```{r}
+pred$Sale_Amount <- predictions
+write.table(pred, file = "pred.csv", quote = FALSE, row.names = FALSE, sep = ",")
+```
+
